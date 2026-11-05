@@ -1,25 +1,64 @@
-from ldap3 import Server, Connection, SUBTREE
-from app.config import LDAP_HOST, LDAP_BASE_DN, LDAP_USER_BASE
+from ldap3 import Connection, SUBTREE, Server
+from ldap3.utils.conv import escape_filter_chars
+
+from app.config import LDAP_HOST, LDAP_PASSWORD, LDAP_USER_BASE, LDAP_USER_DN
+
 
 def authenticate_ldap(username: str, password: str):
     if not username or not password:
         return None
+
+    if not LDAP_USER_DN or not LDAP_PASSWORD:
+        raise RuntimeError("LDAP service account is not configured.")
+
     server = Server(LDAP_HOST)
-    admin = Connection(server, user=None, password=None)
-    # Busca o DN do usuário. Em laboratório, configure usuários e grupos no LDAP.
-    from ldap3 import BASE, ANONYMOUS
+    admin = Connection(
+        server,
+        user=LDAP_USER_DN,
+        password=LDAP_PASSWORD,
+        raise_exceptions=False,
+    )
+    user_conn = None
+
     try:
-        admin = Connection(server, authentication=ANONYMOUS, raise_exceptions=True)
-        admin.bind()
-        admin.search(LDAP_USER_BASE, f"(uid={username})", SUBTREE, attributes=["uid", "cn", "memberOf"])
+        if not admin.bind():
+            description = admin.result.get("description", "unknown error")
+            raise RuntimeError(f"LDAP service bind failed: {description}")
+
+        search_filter = f"(uid={escape_filter_chars(username)})"
+        if not admin.search(
+            LDAP_USER_BASE,
+            search_filter,
+            SUBTREE,
+            attributes=["uid", "cn", "memberOf"],
+        ):
+            description = admin.result.get("description", "unknown error")
+            raise RuntimeError(f"LDAP user search failed: {description}")
+
         if not admin.entries:
             return None
-        user_dn = admin.entries[0].entry_dn
-        user_conn = Connection(server, user=user_dn, password=password, raise_exceptions=True)
+
+        entry = admin.entries[0]
+        user_conn = Connection(
+            server,
+            user=entry.entry_dn,
+            password=password,
+            raise_exceptions=False,
+        )
         if not user_conn.bind():
-            return None
-        groups = [str(x) for x in getattr(admin.entries[0], "memberOf", [])]
-        role = "PROFESSOR" if any("professor" in g.lower() for g in groups) else "ESTUDANTE"
+            if user_conn.result.get("result") == 49:
+                return None
+            description = user_conn.result.get("description", "unknown error")
+            raise RuntimeError(f"LDAP user bind failed: {description}")
+
+        groups = [str(group) for group in getattr(entry, "memberOf", [])]
+        role = (
+            "PROFESSOR"
+            if any("professor" in group.lower() for group in groups)
+            else "ESTUDANTE"
+        )
         return {"username": username, "role": role}
-    except Exception:
-        return None
+    finally:
+        if user_conn is not None:
+            user_conn.unbind()
+        admin.unbind()
